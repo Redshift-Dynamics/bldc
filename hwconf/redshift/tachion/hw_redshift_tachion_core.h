@@ -19,7 +19,6 @@
 // HW properties
 #define HW_HAS_3_SHUNTS
 #define HW_HAS_PHASE_SHUNTS
-#define HW_HAS_PHASE_FILTERS
 #define SERVO_BUZZER
 
 // LEDs
@@ -32,10 +31,6 @@
 #define LED_GREEN_OFF()			palClearPad(LED_GREEN_GPIO, LED_GREEN_PIN)
 #define LED_RED_ON()			palSetPad(LED_RED_GPIO, LED_RED_PIN)
 #define LED_RED_OFF()			palClearPad(LED_RED_GPIO, LED_RED_PIN)
-
-// Phase voltage filters are always populated; there is no GPIO bypass control.
-#define PHASE_FILTER_ON()
-#define PHASE_FILTER_OFF()
 
 // Power stage disable, active high.
 #define PS_DISABLE_GPIO			GPIOC
