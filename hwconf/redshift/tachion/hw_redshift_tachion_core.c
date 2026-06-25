@@ -16,8 +16,11 @@
 #include "commands.h"
 #include "mc_interface.h"
 #include "pwm_servo.h"
+#include "spi_bb.h"
+#include "lsm6ds3.h"
 
 #include <math.h>
+#include <stdio.h>
 
 // Settings
 #define POWERBUT_HOLD_MS				2000
@@ -40,6 +43,8 @@ static THD_WORKING_AREA(motorbut_thread_wa, 512);
 
 // Private functions
 static void terminal_button_test(int argc, const char **argv);
+static void terminal_imu_probe(int argc, const char **argv);
+static uint8_t tachion_imu_probe_read_reg(spi_bb_state *spi, uint8_t reg);
 static bool powerbut_shutdown_allowed(void);
 static bool wait_powerbut_long_press(void);
 static void motorbut_apply_limit(bool enable);
@@ -194,6 +199,11 @@ void hw_init_gpio(void) {
 			"Try sampling the Redshift Tachion buttons",
 			0,
 			terminal_button_test);
+	terminal_register_command_callback(
+			"tachion_imu_probe",
+			"Probe the Redshift Tachion LSM6DS3 SPI pins",
+			"[reg]",
+			terminal_imu_probe);
 
 	chThdCreateStatic(motorbut_thread_wa, sizeof(motorbut_thread_wa),
 			NORMALPRIO, motorbut_thread, NULL);
@@ -322,6 +332,72 @@ static void terminal_button_test(int argc, const char **argv) {
 	commands_printf("current   : %.2f A",
 			(double)mc_interface_get_tot_current_filtered());
 	commands_printf("actual12v : %.2f V", (double)GET_ACTUAL_12V_VOLTAGE());
+}
+
+static void terminal_imu_probe(int argc, const char **argv) {
+	int reg = LSM6DS3_ACC_GYRO_WHO_AM_I_REG;
+
+	if (argc == 2) {
+		sscanf(argv[1], "%i", &reg);
+	}
+
+	if (argc > 2 || reg < 0 || reg > 0xFF) {
+		commands_printf("Usage: tachion_imu_probe [reg]");
+		return;
+	}
+
+	hw_redshift_tachion_disable_flash();
+	palSetPad(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN);
+	palSetPadMode(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN,
+			PAL_MODE_OUTPUT_PUSHPULL |
+			PAL_STM32_OSPEED_HIGHEST);
+
+	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLUP);
+	chThdSleepMilliseconds(1);
+	int miso_pullup = palReadPad(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN);
+	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLDOWN);
+	chThdSleepMilliseconds(1);
+	int miso_pulldown = palReadPad(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN);
+
+	spi_bb_state spi = {
+		.nss_gpio = LSM6DS3_NSS_GPIO,
+		.nss_pin = LSM6DS3_NSS_PIN,
+		.sck_gpio = LSM6DS3_SCK_GPIO,
+		.sck_pin = LSM6DS3_SCK_PIN,
+		.mosi_gpio = LSM6DS3_MOSI_GPIO,
+		.mosi_pin = LSM6DS3_MOSI_PIN,
+		.miso_gpio = LSM6DS3_MISO_GPIO,
+		.miso_pin = LSM6DS3_MISO_PIN,
+	};
+
+	spi_bb_init(&spi);
+
+	commands_printf("Tachion IMU probe reg 0x%02X", reg);
+	commands_printf("CS imu:%d nand:%d miso pu/pd:%d/%d",
+			palReadPad(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN),
+			palReadPad(NAND_CS_GPIO, NAND_CS_PIN),
+			miso_pullup, miso_pulldown);
+
+	for (int i = 0;i < 8;i++) {
+		uint8_t val = tachion_imu_probe_read_reg(&spi, (uint8_t)reg);
+		commands_printf("read[%d] reg 0x%02X = 0x%02X (%d)",
+				i, reg, val, val);
+		chThdSleepMilliseconds(2);
+	}
+}
+
+static uint8_t tachion_imu_probe_read_reg(spi_bb_state *spi, uint8_t reg) {
+	uint8_t res = 0;
+
+	chMtxLock(&spi->mutex);
+	spi_bb_begin(spi);
+	spi_bb_exchange_8_mode_3(spi, reg | 0x80);
+	spi_bb_delay();
+	res = spi_bb_exchange_8_mode_3(spi, 0);
+	spi_bb_end(spi);
+	chMtxUnlock(&spi->mutex);
+
+	return res;
 }
 
 static bool powerbut_shutdown_allowed(void) {
