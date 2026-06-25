@@ -72,9 +72,10 @@ void hw_redshift_tachion_lsm6ds3_spi_bb_init(spi_bb_state *spi_state) {
 }
 
 void hw_redshift_tachion_lsm6ds3_spi_init(i2c_bb_state *i2c_state,
-		spi_bb_state *spi_state, stkalign_t *work_area,
+		spi_bb_state *spi_state, SPIDriver *spi_hw, stkalign_t *work_area,
 		size_t work_area_size) {
 	(void)i2c_state;
+	(void)spi_hw;
 
 	if (!spi_state) {
 		return;

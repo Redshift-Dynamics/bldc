@@ -45,7 +45,9 @@ static bool wait_powerbut_long_press(void);
 static void motorbut_apply_limit(bool enable);
 static THD_FUNCTION(motorbut_thread, arg);
 
+#ifdef USE_HARDWARE_SPI
 #include "hw_redshift_tachion_lsm6ds3_spi.c"
+#endif
 
 void hw_redshift_tachion_buzzer_on(void) {
 	pwm_servo_set_duty(0.5);

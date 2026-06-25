@@ -210,12 +210,9 @@
 #define HW_I2C_SCL_PORT			GPIOA
 #define HW_I2C_SCL_PIN			7
 
-// LSM6DS3 on SPI3 pins. The regular LSM6DS3 SPI path in imu.c uses spi_bb;
-// redirect those calls to the Redshift Tachion hardware-SPI implementation.
+// LSM6DS3 on SPI3 pins. Without USE_HARDWARE_SPI this uses the standard
+// imu/lsm6ds3.c SPI path.
 #define LSM6DS3_USE_SPI
-#define LSM6DS3_SPI_DEV			SPID3
-#define LSM6DS3_SPI_GPIO_AF		GPIO_AF_SPI3
-#define LSM6DS3_SPI_CR1			(SPI_CR1_CPOL | SPI_CR1_CPHA | ((uint16_t)0x0010))
 #define LSM6DS3_NSS_GPIO		GPIOC
 #define LSM6DS3_NSS_PIN			13
 #define LSM6DS3_SCK_GPIO		GPIOC
@@ -225,12 +222,18 @@
 #define LSM6DS3_MOSI_GPIO		GPIOC
 #define LSM6DS3_MOSI_PIN		12
 
+#ifdef USE_HARDWARE_SPI
+#define LSM6DS3_SPI_DEV			SPID3
+#define LSM6DS3_SPI_GPIO_AF		GPIO_AF_SPI3
+#define LSM6DS3_SPI_CR1			(SPI_CR1_CPOL | SPI_CR1_CPHA | ((uint16_t)0x0010))
+#endif
+
 // LSM6DS3 has no magnetometer.
 #ifndef APPCONF_IMU_USE_MAGNETOMETER
 #define APPCONF_IMU_USE_MAGNETOMETER	false
 #endif
 
-#ifdef IMU_IMU_H_
+#if defined(USE_HARDWARE_SPI) && defined(IMU_IMU_H_)
 #define spi_bb_init				hw_redshift_tachion_lsm6ds3_spi_bb_init
 #define lsm6ds3_init			hw_redshift_tachion_lsm6ds3_spi_init
 #define lsm6ds3_set_rate_hz		hw_redshift_tachion_lsm6ds3_spi_set_rate_hz
