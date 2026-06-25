@@ -29,6 +29,8 @@
 #define POWERBUT_SHUTDOWN_CURRENT		2.0
 #define MOTORBUT_CURRENT_LIMIT			2.0
 #define MOTORBUT_THREAD_SLEEP_MS		20
+#define TACHION_STR_IMPL(...)			#__VA_ARGS__
+#define TACHION_STR(...)				TACHION_STR_IMPL(__VA_ARGS__)
 
 // Variables
 static volatile bool i2c_running = false;
@@ -44,7 +46,14 @@ static THD_WORKING_AREA(motorbut_thread_wa, 512);
 // Private functions
 static void terminal_button_test(int argc, const char **argv);
 static void terminal_imu_probe(int argc, const char **argv);
+static void terminal_selfcheck(int argc, const char **argv);
+static void tachion_imu_probe_init(spi_bb_state *spi,
+		int *miso_pullup, int *miso_pulldown);
 static uint8_t tachion_imu_probe_read_reg(spi_bb_state *spi, uint8_t reg);
+static bool tachion_imu_whoami_valid(uint8_t val);
+static int tachion_selfcheck_print_bool(const char *name, bool ok);
+static int tachion_selfcheck_print_level(const char *name, int level,
+		int expected);
 static bool powerbut_shutdown_allowed(void);
 static bool wait_powerbut_long_press(void);
 static void motorbut_apply_limit(bool enable);
@@ -204,6 +213,11 @@ void hw_init_gpio(void) {
 			"Probe the Redshift Tachion LSM6DS3 SPI pins",
 			"[reg]",
 			terminal_imu_probe);
+	terminal_register_command_callback(
+			"tachion_selfcheck",
+			"Run Redshift Tachion hardware self-check",
+			0,
+			terminal_selfcheck);
 
 	chThdCreateStatic(motorbut_thread_wa, sizeof(motorbut_thread_wa),
 			NORMALPRIO, motorbut_thread, NULL);
@@ -346,31 +360,10 @@ static void terminal_imu_probe(int argc, const char **argv) {
 		return;
 	}
 
-	hw_redshift_tachion_disable_flash();
-	palSetPad(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN);
-	palSetPadMode(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN,
-			PAL_MODE_OUTPUT_PUSHPULL |
-			PAL_STM32_OSPEED_HIGHEST);
-
-	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLUP);
-	chThdSleepMilliseconds(1);
-	int miso_pullup = palReadPad(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN);
-	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLDOWN);
-	chThdSleepMilliseconds(1);
-	int miso_pulldown = palReadPad(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN);
-
-	spi_bb_state spi = {
-		.nss_gpio = LSM6DS3_NSS_GPIO,
-		.nss_pin = LSM6DS3_NSS_PIN,
-		.sck_gpio = LSM6DS3_SCK_GPIO,
-		.sck_pin = LSM6DS3_SCK_PIN,
-		.mosi_gpio = LSM6DS3_MOSI_GPIO,
-		.mosi_pin = LSM6DS3_MOSI_PIN,
-		.miso_gpio = LSM6DS3_MISO_GPIO,
-		.miso_pin = LSM6DS3_MISO_PIN,
-	};
-
-	spi_bb_init(&spi);
+	spi_bb_state spi;
+	int miso_pullup = 0;
+	int miso_pulldown = 0;
+	tachion_imu_probe_init(&spi, &miso_pullup, &miso_pulldown);
 
 	commands_printf("Tachion IMU probe reg 0x%02X", reg);
 	commands_printf("CS imu:%d nand:%d miso pu/pd:%d/%d",
@@ -380,10 +373,186 @@ static void terminal_imu_probe(int argc, const char **argv) {
 
 	for (int i = 0;i < 8;i++) {
 		uint8_t val = tachion_imu_probe_read_reg(&spi, (uint8_t)reg);
-		commands_printf("read[%d] reg 0x%02X = 0x%02X (%d)",
+		commands_printf("read_pu[%d] reg 0x%02X = 0x%02X (%d)",
 				i, reg, val, val);
 		chThdSleepMilliseconds(2);
 	}
+
+	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLDOWN);
+
+	for (int i = 0;i < 8;i++) {
+		uint8_t val = tachion_imu_probe_read_reg(&spi, (uint8_t)reg);
+		commands_printf("read_pd[%d] reg 0x%02X = 0x%02X (%d)",
+				i, reg, val, val);
+		chThdSleepMilliseconds(2);
+	}
+}
+
+static void terminal_selfcheck(int argc, const char **argv) {
+	(void)argc;
+	(void)argv;
+
+	int fail = 0;
+
+	commands_printf("Tachion selfcheck: %s", HW_NAME);
+#ifdef USE_HARDWARE_SPI
+	commands_printf("imu build path    : custom hardware SPI");
+	commands_printf("imu driver thread : %s", m_thread_ref ? "running" : "not running");
+#else
+	commands_printf("imu build path    : standard system SPI driver");
+#endif
+	commands_printf("current meas limit: %.1f A",
+			(double)REDSHIFT_TACHION_CURRENT_MEASUREMENT_LIMIT);
+	commands_printf("max abs current   : %.1f A",
+			(double)MCCONF_L_MAX_ABS_CURRENT);
+	commands_printf("HW_LIM_CURRENT    : " TACHION_STR(HW_LIM_CURRENT));
+	commands_printf("HW_LIM_CURRENT_IN : " TACHION_STR(HW_LIM_CURRENT_IN));
+	commands_printf("HW_LIM_CURRENT_ABS: " TACHION_STR(HW_LIM_CURRENT_ABS));
+
+	int power_latch_level = palReadPad(POWERON_GPIO, POWERON_PIN);
+	fail += tachion_selfcheck_print_bool("power latch",
+			power_latch_level == (power_latched ? 1 : 0));
+	commands_printf("power latch detail: level=%d latched=%d ready=%d armed=%d hold=%dms",
+			power_latch_level,
+			power_latched ? 1 : 0,
+			powerbut_shutdown_ready ? 1 : 0,
+			poweroff_armed ? 1 : 0,
+			powerbut_hold_ms);
+
+	bool motorbut_pressed = MOTORBUT_PRESSED();
+	fail += tachion_selfcheck_print_bool("motor limit sync",
+			motorbut_limit_active == motorbut_pressed);
+	commands_printf("buttons           : motor=%d power=%d mot_limit=%d",
+			motorbut_pressed ? 1 : 0,
+			POWERBUT_PRESSED() ? 1 : 0,
+			motorbut_limit_active ? 1 : 0);
+
+	fail += tachion_selfcheck_print_level("gate disable",
+			palReadPad(PS_DISABLE_GPIO, PS_DISABLE_PIN), 0);
+	commands_printf("fan               : level=%d",
+			palReadPad(FAN_GPIO, FAN_PIN));
+	commands_printf("leds              : green=%d red=%d",
+			palReadPad(LED_GREEN_GPIO, LED_GREEN_PIN),
+			palReadPad(LED_RED_GPIO, LED_RED_PIN));
+	commands_printf("i2c scaffold      : %s",
+			i2c_running ? "running" : "stopped");
+
+	hw_redshift_tachion_disable_flash();
+	fail += tachion_selfcheck_print_level("external spi cs",
+			palReadPad(HW_SPI_PORT_NSS, HW_SPI_PIN_NSS), 1);
+	fail += tachion_selfcheck_print_level("nand cs",
+			palReadPad(NAND_CS_GPIO, NAND_CS_PIN), 1);
+
+	spi_bb_state spi;
+	int miso_pullup = 0;
+	int miso_pulldown = 0;
+	tachion_imu_probe_init(&spi, &miso_pullup, &miso_pulldown);
+	fail += tachion_selfcheck_print_level("imu cs idle",
+			palReadPad(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN), 1);
+	fail += tachion_selfcheck_print_bool("imu miso idle",
+			miso_pullup == 1 && miso_pulldown == 0);
+	commands_printf("imu miso detail   : pullup=%d pulldown=%d",
+			miso_pullup, miso_pulldown);
+
+	uint8_t who_pu[3] = {0};
+	uint8_t who_pd[3] = {0};
+	for (int i = 0;i < 3;i++) {
+		who_pu[i] = tachion_imu_probe_read_reg(&spi,
+				LSM6DS3_ACC_GYRO_WHO_AM_I_REG);
+		chThdSleepMilliseconds(2);
+	}
+
+	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN,
+			PAL_MODE_INPUT_PULLDOWN);
+	for (int i = 0;i < 3;i++) {
+		who_pd[i] = tachion_imu_probe_read_reg(&spi,
+				LSM6DS3_ACC_GYRO_WHO_AM_I_REG);
+		chThdSleepMilliseconds(2);
+	}
+
+	bool imu_ok = tachion_imu_whoami_valid(who_pu[0]) ||
+			tachion_imu_whoami_valid(who_pu[1]) ||
+			tachion_imu_whoami_valid(who_pu[2]) ||
+			tachion_imu_whoami_valid(who_pd[0]) ||
+			tachion_imu_whoami_valid(who_pd[1]) ||
+			tachion_imu_whoami_valid(who_pd[2]);
+	fail += tachion_selfcheck_print_bool("imu whoami", imu_ok);
+	commands_printf("imu whoami pu     : 0x%02X 0x%02X 0x%02X",
+			who_pu[0], who_pu[1], who_pu[2]);
+	commands_printf("imu whoami pd     : 0x%02X 0x%02X 0x%02X",
+			who_pd[0], who_pd[1], who_pd[2]);
+	if (!imu_ok) {
+		if (who_pu[0] == 0xFF && who_pd[0] == 0x00 &&
+				miso_pullup == 1 && miso_pulldown == 0) {
+			commands_printf("imu diag          : MISO floating/no response");
+		} else if (who_pu[0] == 0xFF && who_pd[0] == 0xFF) {
+			commands_printf("imu diag          : MISO held high");
+		} else if (who_pu[0] == 0x00 && who_pd[0] == 0x00) {
+			commands_printf("imu diag          : MISO held low");
+		} else {
+			commands_printf("imu diag          : unexpected WHO_AM_I pattern");
+		}
+	}
+	fail += tachion_selfcheck_print_level("imu cs after",
+			palReadPad(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN), 1);
+
+	commands_printf("hall              : %d %d %d",
+			READ_HALL1(), READ_HALL2(), READ_HALL3());
+	commands_printf("adc raw           : vin=%d 12v=%d mos=%d motor=%d",
+			ADC_Value[ADC_IND_VIN_SENS],
+			ADC_Value[ADC_IND_ACTUAL_12V],
+			ADC_Value[ADC_IND_TEMP_MOS],
+			ADC_Value[ADC_IND_TEMP_MOTOR]);
+
+	float vin = GET_INPUT_VOLTAGE();
+	float actual12v = GET_ACTUAL_12V_VOLTAGE();
+	float mos_temp = NTC_TEMP_MOS1();
+	fail += tachion_selfcheck_print_bool("vin adc",
+			vin > 10.0 && vin < 250.0);
+	fail += tachion_selfcheck_print_bool("12v rail",
+			actual12v > 6.0 && actual12v < 16.0);
+	fail += tachion_selfcheck_print_bool("mos temp",
+			mos_temp > -40.0 && mos_temp < 150.0);
+	commands_printf("analog values     : vin=%.2fV 12v=%.2fV mos=%.1fC",
+			(double)vin, (double)actual12v, (double)mos_temp);
+	commands_printf("inj current raw   : a=%d b=%d c=%d",
+			HW_GET_INJ_CURR1(),
+			HW_GET_INJ_CURR2(),
+			HW_GET_INJ_CURR3());
+	commands_printf("motor runtime     : rpm=%.1f current=%.2fA",
+			(double)mc_interface_get_rpm(),
+			(double)mc_interface_get_tot_current_filtered());
+
+	commands_printf("selfcheck result  : %s (%d fail)",
+			fail == 0 ? "OK" : "FAIL", fail);
+}
+
+static void tachion_imu_probe_init(spi_bb_state *spi,
+		int *miso_pullup, int *miso_pulldown) {
+	hw_redshift_tachion_disable_flash();
+	palSetPad(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN);
+	palSetPadMode(LSM6DS3_NSS_GPIO, LSM6DS3_NSS_PIN,
+			PAL_MODE_OUTPUT_PUSHPULL |
+			PAL_STM32_OSPEED_HIGHEST);
+
+	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLUP);
+	chThdSleepMilliseconds(1);
+	*miso_pullup = palReadPad(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN);
+	palSetPadMode(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN, PAL_MODE_INPUT_PULLDOWN);
+	chThdSleepMilliseconds(1);
+	*miso_pulldown = palReadPad(LSM6DS3_MISO_GPIO, LSM6DS3_MISO_PIN);
+
+	spi->nss_gpio = LSM6DS3_NSS_GPIO;
+	spi->nss_pin = LSM6DS3_NSS_PIN;
+	spi->sck_gpio = LSM6DS3_SCK_GPIO;
+	spi->sck_pin = LSM6DS3_SCK_PIN;
+	spi->mosi_gpio = LSM6DS3_MOSI_GPIO;
+	spi->mosi_pin = LSM6DS3_MOSI_PIN;
+	spi->miso_gpio = LSM6DS3_MISO_GPIO;
+	spi->miso_pin = LSM6DS3_MISO_PIN;
+	spi->mutex_init_done = false;
+
+	spi_bb_init(spi);
 }
 
 static uint8_t tachion_imu_probe_read_reg(spi_bb_state *spi, uint8_t reg) {
@@ -398,6 +567,23 @@ static uint8_t tachion_imu_probe_read_reg(spi_bb_state *spi, uint8_t reg) {
 	chMtxUnlock(&spi->mutex);
 
 	return res;
+}
+
+static bool tachion_imu_whoami_valid(uint8_t val) {
+	return val == 0x69 || val == 0x6A || val == 0x6C;
+}
+
+static int tachion_selfcheck_print_bool(const char *name, bool ok) {
+	commands_printf("%-18s: %s", name, ok ? "OK" : "FAIL");
+	return ok ? 0 : 1;
+}
+
+static int tachion_selfcheck_print_level(const char *name, int level,
+		int expected) {
+	bool ok = level == expected;
+	commands_printf("%-18s: %s level=%d expected=%d",
+			name, ok ? "OK" : "FAIL", level, expected);
+	return ok ? 0 : 1;
 }
 
 static bool powerbut_shutdown_allowed(void) {
